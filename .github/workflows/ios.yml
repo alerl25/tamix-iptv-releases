@@ -1,0 +1,95 @@
+name: iPhone (IPA)
+
+# Builds the iPhone app from a published release: its web bundle
+# (Tamix-IPTV-<version>-web.zip) inside a Capacitor shell with Tamix's
+# native VLC player, then uploads Tamix-IPTV-<version>-iOS.ipa to the same
+# release. The IPA is unsigned: Sideloadly signs it with the user's Apple ID
+# while installing it on the iPhone.
+on:
+    workflow_dispatch:
+        inputs:
+            version:
+                description: 'Version to build (for example 0.34.1)'
+                required: true
+
+permissions:
+    contents: write
+
+concurrency:
+    group: ios-${{ inputs.version }}
+    cancel-in-progress: true
+
+jobs:
+    ipa:
+        runs-on: macos-15
+        timeout-minutes: 60
+        env:
+            VERSION: ${{ inputs.version }}
+            GH_TOKEN: ${{ github.token }}
+        steps:
+            - uses: actions/checkout@v4
+
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 22
+
+            - name: Web bundle of the release
+              working-directory: ios
+              run: |
+                  gh release download "v${VERSION}" -p "Tamix-IPTV-${VERSION}-web.zip" -O web.zip
+                  mkdir -p www && unzip -q web.zip -d www
+                  test -f www/index.html || { ls www; echo "index.html missing"; exit 1; }
+
+            - name: Capacitor iOS project
+              working-directory: ios
+              run: |
+                  npm install --no-audit --no-fund
+                  npx cap add ios --packagemanager CocoaPods
+                  ruby native/prepare.rb
+                  npx cap sync ios
+                  (cd ios/App && pod install)
+
+            - name: Version numbers
+              run: |
+                  IFS=. read -r MA MI PA <<< "$VERSION"
+                  echo "BUILD_NUMBER=$((MA * 10000 + MI * 100 + PA))" >> "$GITHUB_ENV"
+
+            - name: Simulator smoke test
+              continue-on-error: true
+              working-directory: ios/ios/App
+              run: |
+                  xcodebuild -workspace App.xcworkspace -scheme App -configuration Debug \
+                    -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+                    -derivedDataPath "$RUNNER_TEMP/sim" CODE_SIGNING_ALLOWED=NO build | tail -n 20
+                  UDID=$(xcrun simctl list devices available -j | python3 -c "import json,sys; d=json.load(sys.stdin)['devices']; print(next(x['udid'] for k,v in d.items() if 'iOS' in k for x in v if x['name'].startswith('iPhone')))")
+                  xcrun simctl boot "$UDID"
+                  xcrun simctl bootstatus "$UDID" -b
+                  xcrun simctl install "$UDID" "$RUNNER_TEMP/sim/Build/Products/Debug-iphonesimulator/App.app"
+                  xcrun simctl launch "$UDID" com.tamix.iptv
+                  sleep 40
+                  xcrun simctl io "$UDID" screenshot "$RUNNER_TEMP/simulator.png"
+
+            - uses: actions/upload-artifact@v4
+              if: always()
+              with:
+                  name: simulator-screenshot
+                  path: ${{ runner.temp }}/simulator.png
+                  if-no-files-found: ignore
+
+            - name: Build the IPA (unsigned)
+              working-directory: ios/ios/App
+              run: |
+                  set -o pipefail
+                  xcodebuild -workspace App.xcworkspace -scheme App -configuration Release \
+                    -sdk iphoneos -destination 'generic/platform=iOS' \
+                    -derivedDataPath "$RUNNER_TEMP/device" \
+                    MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+                    CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+                    build | tail -n 30
+                  mkdir -p "$RUNNER_TEMP/ipa/Payload"
+                  cp -R "$RUNNER_TEMP/device/Build/Products/Release-iphoneos/App.app" "$RUNNER_TEMP/ipa/Payload/"
+                  (cd "$RUNNER_TEMP/ipa" && zip -qry "Tamix-IPTV-${VERSION}-iOS.ipa" Payload)
+                  ls -la "$RUNNER_TEMP/ipa"
+
+            - name: Upload to the release
+              run: gh release upload "v${VERSION}" "$RUNNER_TEMP/ipa/Tamix-IPTV-${VERSION}-iOS.ipa" --clobber

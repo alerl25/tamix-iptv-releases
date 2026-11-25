@@ -1,0 +1,15 @@
+{
+    "appId": "com.tamix.iptv",
+    "appName": "Tamix IPTV",
+    "webDir": "www",
+    "loggingBehavior": "none",
+    "ios": {
+        "contentInset": "never",
+        "allowsLinkPreview": false
+    },
+    "plugins": {
+        "CapacitorHttp": {
+            "enabled": true
+        }
+    }
+}

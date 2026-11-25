@@ -1,0 +1,11 @@
+{
+    "name": "tamix-iptv-ios",
+    "private": true,
+    "description": "Builds the Tamix IPTV iPhone app (IPA) from a release's web bundle.",
+    "dependencies": {
+        "@capacitor/app": "8.1.2",
+        "@capacitor/cli": "8.4.3",
+        "@capacitor/core": "8.4.3",
+        "@capacitor/ios": "8.4.3"
+    }
+}
