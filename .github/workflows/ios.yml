@@ -22,7 +22,7 @@ concurrency:
 jobs:
     ipa:
         runs-on: macos-15-intel
-        timeout-minutes: 60
+        timeout-minutes: 150
         env:
             VERSION: ${{ inputs.version }}
             GH_TOKEN: ${{ github.token }}
@@ -54,6 +54,33 @@ jobs:
                   IFS=. read -r MA MI PA <<< "$VERSION"
                   echo "BUILD_NUMBER=$((MA * 10000 + MI * 100 + PA))" >> "$GITHUB_ENV"
 
+            # The IPA goes first: the shared runner is slow and the simulator
+            # check below is only a smoke test. No dSYMs (dsymutil on the VLC
+            # framework alone took tens of minutes), arm64 only.
+            - name: Build the IPA (unsigned)
+              working-directory: ios/ios/App
+              run: |
+                  xcodebuild -workspace App.xcworkspace -scheme App -configuration Release \
+                    -sdk iphoneos -destination 'generic/platform=iOS' \
+                    -derivedDataPath "$RUNNER_TEMP/device" \
+                    MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+                    CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+                    ARCHS=arm64 ONLY_ACTIVE_ARCH=NO DEBUG_INFORMATION_FORMAT=dwarf \
+                    GCC_GENERATE_DEBUGGING_SYMBOLS=NO \
+                    build > "$RUNNER_TEMP/device-build.log" 2>&1 || {
+                      grep -E "error:|BUILD FAILED" "$RUNNER_TEMP/device-build.log" | head -40
+                      tail -n 40 "$RUNNER_TEMP/device-build.log"
+                      exit 1
+                    }
+                  tail -n 5 "$RUNNER_TEMP/device-build.log"
+                  mkdir -p "$RUNNER_TEMP/ipa/Payload"
+                  cp -R "$RUNNER_TEMP/device/Build/Products/Release-iphoneos/App.app" "$RUNNER_TEMP/ipa/Payload/"
+                  (cd "$RUNNER_TEMP/ipa" && zip -qry "Tamix-IPTV-${VERSION}-iOS.ipa" Payload)
+                  ls -la "$RUNNER_TEMP/ipa"
+
+            - name: Upload to the release
+              run: gh release upload "v${VERSION}" "$RUNNER_TEMP/ipa/Tamix-IPTV-${VERSION}-iOS.ipa" --clobber
+
             - name: Simulator smoke test
               continue-on-error: true
               working-directory: ios/ios/App
@@ -75,21 +102,3 @@ jobs:
                   name: simulator-screenshot
                   path: ${{ runner.temp }}/simulator.png
                   if-no-files-found: ignore
-
-            - name: Build the IPA (unsigned)
-              working-directory: ios/ios/App
-              run: |
-                  set -o pipefail
-                  xcodebuild -workspace App.xcworkspace -scheme App -configuration Release \
-                    -sdk iphoneos -destination 'generic/platform=iOS' \
-                    -derivedDataPath "$RUNNER_TEMP/device" \
-                    MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
-                    CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
-                    build | tail -n 30
-                  mkdir -p "$RUNNER_TEMP/ipa/Payload"
-                  cp -R "$RUNNER_TEMP/device/Build/Products/Release-iphoneos/App.app" "$RUNNER_TEMP/ipa/Payload/"
-                  (cd "$RUNNER_TEMP/ipa" && zip -qry "Tamix-IPTV-${VERSION}-iOS.ipa" Payload)
-                  ls -la "$RUNNER_TEMP/ipa"
-
-            - name: Upload to the release
-              run: gh release upload "v${VERSION}" "$RUNNER_TEMP/ipa/Tamix-IPTV-${VERSION}-iOS.ipa" --clobber
