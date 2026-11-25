@@ -5,6 +5,7 @@
     "loggingBehavior": "none",
     "ios": {
         "contentInset": "always",
+        "backgroundColor": "#0e0f13",
         "allowsLinkPreview": false
     },
     "plugins": {
