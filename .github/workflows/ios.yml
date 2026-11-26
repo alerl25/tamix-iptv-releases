@@ -11,6 +11,10 @@ on:
             version:
                 description: 'Version to build (for example 0.34.1)'
                 required: true
+            publish:
+                description: 'Upload the IPA to the release (off = compile check only)'
+                type: boolean
+                default: true
 
 permissions:
     contents: write
@@ -79,6 +83,7 @@ jobs:
                   ls -la "$RUNNER_TEMP/ipa"
 
             - name: Upload to the release
+              if: ${{ inputs.publish }}
               run: gh release upload "v${VERSION}" "$RUNNER_TEMP/ipa/Tamix-IPTV-${VERSION}-iOS.ipa" --clobber
 
             - name: Simulator smoke test
