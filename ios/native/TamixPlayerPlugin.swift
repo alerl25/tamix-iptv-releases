@@ -37,17 +37,30 @@ public class TamixPlayerPlugin: CAPPlugin, CAPBridgedPlugin {
             isLive: call.getBool("isLive") ?? false
         )
         DispatchQueue.main.async { [weak self] in
-            guard let self = self, let host = self.bridge?.viewController else {
+            guard let self = self, self.bridge?.viewController != nil else {
                 call.reject("No view to present the player")
                 return
             }
-            self.current?.close(reason: "stopped")
-            let player = TamixPlayerViewController(request: request) { [weak self] event, data in
-                self?.notifyListeners(event, data: data)
+            // Never present over a player that is still closing: wait until the
+            // old one is off screen.
+            let present: () -> Void = { [weak self] in
+                guard let self = self, let host = self.bridge?.viewController else {
+                    call.reject("No view to present the player")
+                    return
+                }
+                let player = TamixPlayerViewController(request: request) { [weak self] event, data in
+                    self?.notifyListeners(event, data: data)
+                }
+                player.modalPresentationStyle = .fullScreen
+                self.current = player
+                host.present(player, animated: true) { call.resolve() }
             }
-            player.modalPresentationStyle = .fullScreen
-            self.current = player
-            host.present(player, animated: true) { call.resolve() }
+            if let old = self.current {
+                old.close(reason: "stopped")
+                old.whenDismissed(present)
+            } else {
+                present()
+            }
         }
     }
 

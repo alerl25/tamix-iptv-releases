@@ -1,3 +1,4 @@
+import AVFoundation
 import MobileVLCKit
 import UIKit
 
@@ -29,6 +30,22 @@ final class TamixPlayerViewController: UIViewController, VLCMediaPlayerDelegate 
     private var hideTimer: Timer?
     private var sliding = false
 
+    // Live channels: how many times a VLC error is retried before giving up.
+    private static let maxLiveRetries = 2
+    private static let retryDelay: TimeInterval = 1.5
+    private var retryCount = 0
+    private var retryPending = false
+
+    // Last values painted on the controls, so a tick that changes nothing
+    // visible does no UI work.
+    private var lengthMs: Double = 0
+    private var shownSecond = -1
+    private var shownDuration: Double = 0
+
+    private var backgroundObserver: NSObjectProtocol?
+    private var dismissed = false
+    private var dismissWaiters: [() -> Void] = []
+
     init(request: TamixPlayRequest, emit: @escaping Emit) {
         self.request = request
         self.emit = emit
@@ -36,6 +53,8 @@ final class TamixPlayerViewController: UIViewController, VLCMediaPlayerDelegate 
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+
+    deinit { removeBackgroundObserver() }
 
     override var prefersStatusBarHidden: Bool { true }
     override var prefersHomeIndicatorAutoHidden: Bool { true }
@@ -45,6 +64,9 @@ final class TamixPlayerViewController: UIViewController, VLCMediaPlayerDelegate 
         super.viewDidLoad()
         view.backgroundColor = .black
         layout()
+        backgroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.pauseForBackground() }
         start()
     }
 
@@ -60,7 +82,7 @@ final class TamixPlayerViewController: UIViewController, VLCMediaPlayerDelegate 
 
     // MARK: - Playback
 
-    private func start() {
+    private func makeMedia() -> VLCMedia {
         let media = VLCMedia(url: request.url)
         if let agent = request.userAgent, !agent.isEmpty {
             media.addOption(":http-user-agent=\(agent)")
@@ -71,22 +93,48 @@ final class TamixPlayerViewController: UIViewController, VLCMediaPlayerDelegate 
         // A steadier start on live channels, a quicker one on films.
         media.addOption(":network-caching=\(request.isLive ? 2000 : 1200)")
         media.addOption(":http-reconnect")
+        return media
+    }
+
+    private func start() {
+        activateAudioSession()
         player.delegate = self
         player.drawable = videoView
-        player.media = media
+        player.media = makeMedia()
         spinner.startAnimating()
         player.play()
+    }
+
+    /// Plays with the silent switch on and tells other apps' audio to step
+    /// aside. A failure here must never stop the video, so errors are ignored.
+    private func activateAudioSession() {
+        let session = AVAudioSession.sharedInstance()
+        do {
+            try session.setCategory(.playback, mode: .moviePlayback)
+        } catch {}
+        do {
+            try session.setActive(true)
+        } catch {}
+    }
+
+    private func deactivateAudioSession() {
+        do {
+            try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        } catch {}
     }
 
     func close(reason: String) {
         guard !closed else { return }
         closed = true
         hideTimer?.invalidate()
+        removeBackgroundObserver()
         accumulatePlayed()
         let position = Double(player.time.intValue)
+        refreshLength()
         let duration = durationMs()
         player.stop()
         player.delegate = nil
+        deactivateAudioSession()
         emit("closed", [
             "reason": reason,
             "positionMs": max(0, position),
@@ -94,13 +142,48 @@ final class TamixPlayerViewController: UIViewController, VLCMediaPlayerDelegate 
             "playedMs": playedMs,
         ])
         if presentingViewController != nil {
-            dismiss(animated: true)
+            dismiss(animated: true) { self.finishDismiss() }
+        } else {
+            finishDismiss()
         }
     }
 
+    /// Runs `block` once this player is off screen (right away if it already is).
+    func whenDismissed(_ block: @escaping () -> Void) {
+        if dismissed { block() } else { dismissWaiters.append(block) }
+    }
+
+    private func finishDismiss() {
+        dismissed = true
+        let waiters = dismissWaiters
+        dismissWaiters = []
+        waiters.forEach { $0() }
+    }
+
+    private func removeBackgroundObserver() {
+        if let token = backgroundObserver {
+            NotificationCenter.default.removeObserver(token)
+            backgroundObserver = nil
+        }
+    }
+
+    /// Films pause when the app goes to the background; coming back does nothing
+    /// by itself. Live channels are left alone.
+    private func pauseForBackground() {
+        guard !closed, !request.isLive, player.isPlaying else { return }
+        player.pause()
+        updatePlayButton()
+    }
+
+    private func refreshLength() {
+        if request.isLive { return }
+        lengthMs = max(0, Double(player.media?.length.intValue ?? 0))
+    }
+
     private func durationMs() -> Double {
-        let length = Double(player.media?.length.intValue ?? 0)
-        return request.isLive || length <= 0 ? -1 : length
+        if request.isLive { return -1 }
+        if lengthMs <= 0 { refreshLength() }
+        return lengthMs > 0 ? lengthMs : -1
     }
 
     private func accumulatePlayed() {
@@ -110,9 +193,33 @@ final class TamixPlayerViewController: UIViewController, VLCMediaPlayerDelegate 
         }
     }
 
+    /// VLC may call its delegate off the main thread; everything that touches
+    /// UIKit or emits events to the web runs on the main thread.
+    private func onMain(_ work: @escaping () -> Void) {
+        if Thread.isMainThread {
+            work()
+        } else {
+            DispatchQueue.main.async { work() }
+        }
+    }
+
     func mediaPlayerStateChanged(_ aNotification: Notification) {
-        switch player.state {
+        // Read the state now: by the time a queued block runs it may have moved on.
+        let state = player.state
+        onMain { [weak self] in self?.handleState(state) }
+    }
+
+    func mediaPlayerTimeChanged(_ aNotification: Notification) {
+        let position = Double(player.time.intValue)
+        onMain { [weak self] in self?.handleTime(position) }
+    }
+
+    private func handleState(_ state: VLCMediaPlayerState) {
+        guard !closed else { return }
+        switch state {
         case .playing:
+            // Playing again after a retry: the next error gets its full retries.
+            retryCount = 0
             spinner.stopAnimating()
             if playingSince == nil { playingSince = Date() }
             if !started {
@@ -134,8 +241,7 @@ final class TamixPlayerViewController: UIViewController, VLCMediaPlayerDelegate 
             emit("ended", [:])
             close(reason: "ended")
         case .error:
-            emit("error", ["kind": "unknown", "code": "VLC_ERROR"])
-            close(reason: "error")
+            handleError()
         case .stopped:
             // VLC stops at the end of some streams without `.ended`.
             if started && !closed && !request.isLive {
@@ -147,17 +253,53 @@ final class TamixPlayerViewController: UIViewController, VLCMediaPlayerDelegate 
         }
     }
 
-    func mediaPlayerTimeChanged(_ aNotification: Notification) {
-        let position = Double(player.time.intValue)
-        let duration = durationMs()
-        if !sliding, duration > 0 {
-            slider.value = Float(position / duration)
+    /// A live channel gets a couple of quiet retries before the error is real;
+    /// a film keeps the old behaviour (report and close at once).
+    private func handleError() {
+        if retryPending { return }
+        if request.isLive && retryCount < TamixPlayerViewController.maxLiveRetries {
+            retryCount += 1
+            retryPending = true
+            accumulatePlayed()
+            spinner.startAnimating()
+            DispatchQueue.main.asyncAfter(deadline: .now() + TamixPlayerViewController.retryDelay) { [weak self] in
+                guard let self = self else { return }
+                self.retryPending = false
+                guard !self.closed else { return }
+                self.player.stop()
+                self.player.media = self.makeMedia()
+                self.player.play()
+            }
+            return
         }
-        timeLabel.text = duration > 0
-            ? "\(format(position)) / \(format(duration))"
-            : "EN DIRECTO"
-        if Date().timeIntervalSince(lastTimeEvent) >= 1 {
-            lastTimeEvent = Date()
+        emit("error", ["kind": "unknown", "code": "VLC_ERROR"])
+        close(reason: "error")
+    }
+
+    private func handleTime(_ position: Double) {
+        guard !closed else { return }
+        let now = Date()
+        let emitDue = now.timeIntervalSince(lastTimeEvent) >= 1
+        if emitDue { refreshLength() }
+        let duration = durationMs()
+        if duration > 0 {
+            // Repaint only when the shown second (or the length) changed.
+            let second = Int(position / 1000)
+            if second != shownSecond || duration != shownDuration {
+                shownSecond = second
+                shownDuration = duration
+                if !sliding {
+                    slider.value = Float(position / duration)
+                }
+                timeLabel.text = "\(format(position)) / \(format(duration))"
+            }
+        } else if shownDuration != -1 {
+            shownDuration = -1
+            shownSecond = -1
+            timeLabel.text = "EN DIRECTO"
+        }
+        if emitDue {
+            lastTimeEvent = now
             emit("time", [
                 "positionMs": position,
                 "durationMs": duration,
